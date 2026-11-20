@@ -8,7 +8,7 @@
 #include <stdint.h>
 #include <stdio.h> 
 #include <stdlib.h> 
-#include <string.h> /
+#include <string.h>
 #include <math.h> 
 #include <signal.h> 
 
@@ -19,12 +19,14 @@
 
 typedef enum { TX_BPSK, TX_QPSK } constellation_t;
 
+// Прямоугольная импульсная характеристика для формирования символов
 static const int16_t pulse_kernel[SYMBOL_SAMPLES] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
 static void fill_random_bits(uint8_t *random_bits, size_t bit_count)
 {
-    for (size_t i = 0; i < bit_count; i++)
-        random_bits[i] = (uint8_t)(rand() % 2);
+    for (size_t i = 0; i < bit_count; ++i) {
+        random_bits[i] = static_cast<uint8_t>(rand() % 2);
+    }
 }
 
 static void encode_bpsk(const uint8_t *random_bits, int16_t *mapped_buffer, size_t symbol_count)
@@ -50,13 +52,12 @@ static void insert_zero_samples(const int16_t *input_symbols, size_t symbol_coun
 {
     for (size_t i = 0; i < symbol_count; i++)
     {
-        size_t write_index = i * samples_per_symbol * 2;
-        output_samples[write_index] = input_symbols[2 * i];
-        output_samples[write_index + 1] = input_symbols[2 * i + 1];
-        for (size_t j = 1; j < samples_per_symbol; j++)
-        {
-            output_samples[write_index + 2 * j] = 0;
-            output_samples[write_index + 2 * j + 1] = 0;
+        const size_t base = 2 * i * samples_per_symbol;
+        output_samples[base] = input_symbols[2 * i];
+        output_samples[base + 1] = input_symbols[2 * i + 1];
+        for (size_t j = 1; j < samples_per_symbol; ++j) {
+            output_samples[base + 2 * j] = 0;
+            output_samples[base + 2 * j + 1] = 0;
         }
     }
 }
@@ -67,8 +68,8 @@ static void apply_pulse_filter(const int16_t *upsampled_data, int16_t *filtered_
     for (size_t i = 0; i < total_count; i++)
     {
         int32_t i_accumulator = 0, q_accumulator = 0;
-        for (size_t j = 0; j < SYMBOL_SAMPLES && j <= i; j++)
-        {
+        const size_t tap_count = (i + 1 < SYMBOL_SAMPLES) ? i + 1 : SYMBOL_SAMPLES;
+        for (size_t j = 0; j < tap_count; ++j) {
             i_accumulator += upsampled_data[2 * (i - j)] * pulse_kernel[j];
             q_accumulator += upsampled_data[2 * (i - j) + 1] * pulse_kernel[j];
         }
@@ -98,8 +99,11 @@ static void fill_transmit_frame(int16_t *tx_data, size_t tx_block_size, constell
 
     int16_t *payload_start = tx_data + 2 * FRAME_PREFIX_SAMPLES;
     memset(payload_start, 0, 2 * (tx_block_size - FRAME_PREFIX_SAMPLES) * sizeof(int16_t));
-    for (size_t i = 0; i < 2 * payload_size; i++)
-        payload_start[i] = filtered_symbols[i] * 16;
+    // Переносим в буфер пары I/Q, сохраняя выравнивание CS16.
+    for (size_t i = 0; i < payload_size; ++i) {
+        payload_start[2 * i] = filtered_symbols[2 * i] * 16;
+        payload_start[2 * i + 1] = filtered_symbols[2 * i + 1] * 16;
+    }
 
     free(random_bits); free(symbol_data); free(zero_padded); free(filtered_symbols);
 }
@@ -109,7 +113,10 @@ static void fill_transmit_frame(int16_t *tx_data, size_t tx_block_size, constell
 #define TRANSMITTER_GAIN -40.0
 #define STATUS_PERIOD 250 // период вывода статистики
 #define NOISE_THRESHOLD 20 // порог для отметки слабого входного сигнала
-#define SELECTED_MODULATION TX_QPSK // активная схема отображения битов
+#define SELECTED_MODULATION TX_QPSK // схема модуляции по умолчанию
+
+static const size_t RX_WARMUP_BUFFERS = 128;
+static const long long TX_ADVANCE_NS = 4000000LL; // передача через 4 мс
 
 double upper_frequency = 821e6;
 double lower_frequency = 766e6;
@@ -167,6 +174,14 @@ int start_radio(const char *radio_uri, bool tx_mode) {
   SoapySDRStream *receiver_stream = SoapySDRDevice_setupStream(radio, SOAPY_SDR_RX, SOAPY_SDR_CS16, channel_ids, number_of_channels, NULL);
   SoapySDRStream *transmitter_stream = SoapySDRDevice_setupStream(radio, SOAPY_SDR_TX, SOAPY_SDR_CS16, channel_ids, number_of_channels, NULL);
 
+  if (receiver_stream == NULL || transmitter_stream == NULL) {
+    fprintf(stderr, "Не удалось создать SDR поток: %s\n", SoapySDRDevice_lastError());
+    if (receiver_stream != NULL) SoapySDRDevice_closeStream(radio, receiver_stream);
+    if (transmitter_stream != NULL) SoapySDRDevice_closeStream(radio, transmitter_stream);
+    SoapySDRDevice_unmake(radio);
+    return 1;
+  }
+
   SoapySDRDevice_activateStream(radio, receiver_stream, 0, 0, 0);
   SoapySDRDevice_activateStream(radio, transmitter_stream, 0, 0, 0);
 
@@ -196,12 +211,13 @@ int start_radio(const char *radio_uri, bool tx_mode) {
   signal(SIGINT, stop_on_interrupt);
 
   void *input_buffers[] = {rx_data};
-  for (size_t n = 0; n < 128 && work_active; ) {
+  // Удаляем старые буферы из очереди приёмника.
+  for (size_t n = 0; n < RX_WARMUP_BUFFERS && work_active; ) {
     int io_flags;
     long long receive_time_ns;
     int read_count = SoapySDRDevice_readStream(radio, receiver_stream, input_buffers, rx_block_size, &io_flags, &receive_time_ns, read_timeout_us);
-    if (read_count < 0) continue; 
-    n++;
+    if (read_count <= 0) continue;
+    ++n;
   }
 
   printf("Start...\n");
@@ -212,8 +228,9 @@ int start_radio(const char *radio_uri, bool tx_mode) {
     int io_flags;
     long long receive_time_ns = previous_time_ns;
     int read_count = SoapySDRDevice_readStream(radio, receiver_stream, input_buffers, rx_block_size, &io_flags, &receive_time_ns, read_timeout_us);
-    if (read_count < 0) continue;
+    if (read_count <= 0) continue;
 
+    // При пустом чтении не обновляем ни статистику, ни время передачи.
     // сбор статистики по входному потоку
     for (int i = 0; i < 2 * read_count; i++)
       if (abs(rx_data[i]) > max_amplitude)
@@ -236,10 +253,10 @@ int start_radio(const char *radio_uri, bool tx_mode) {
     previous_time_ns = receive_time_ns;
 
     // планирование передачи относительно времени приёма
-    long long scheduled_time_ns = previous_time_ns + (4 * 1000 * 1000);  // запуск передачи с отступом 4 мс
+    long long scheduled_time_ns = previous_time_ns + TX_ADVANCE_NS;
 
     for (size_t i = 0; i < 8; i++) {
-      uint8_t timestamp_part = (scheduled_time_ns >> (i * 8)) & 0xff;
+      const uint8_t timestamp_part = static_cast<uint8_t>((scheduled_time_ns >> (i * 8)) & 0xff);
       tx_data[2 + i] = timestamp_part << 4;
     }
 
