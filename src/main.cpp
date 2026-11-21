@@ -1,303 +1,226 @@
-// Примеры запуска для двух направлений радиоканала:
-// ./main tx [uri] -> TX 821 МГц, RX 766 МГц
-// ./main rx [uri] -> TX 766 МГц, RX 821 МГц
-
-#include <SoapySDR/Device.h> // создание дескриптора SDR устройства
-#include <SoapySDR/Formats.h>  // Типы данных, используемых для записи сэмплов
+#include <SoapySDR/Device.h>
+#include <SoapySDR/Formats.h>
+#include <algorithm>
+#include <cmath>
 #include <complex>
-#include <stdint.h>
-#include <stdio.h> 
-#include <stdlib.h> 
-#include <string.h>
-#include <math.h> 
-#include <signal.h> 
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
+#include <random>
+#include <string>
+#include <vector>
 
-// Формирование цифрового потока передатчика
-#define SYMBOL_SAMPLES 10 // отсчётов на один символ
-#define SYMBOL_AMPLITUDE 2000  // уровень созвездия в формате ЦАП
-#define FRAME_PREFIX_SAMPLES 6 // служебные комплексные отсчёты для заголовка
+using IQ = std::complex<float>;
+constexpr int SAMPLES_PER_BIT = 10;
+constexpr int HEADER = 6;
+constexpr double RATE = 1'000'000.0;
+constexpr double FREQUENCY = 800e6;
+constexpr float PI = 3.14159265358979323846f;
 
-typedef enum { TX_BPSK, TX_QPSK } constellation_t;
-
-// Прямоугольная импульсная характеристика для формирования символов
-static const int16_t pulse_kernel[SYMBOL_SAMPLES] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
-
-static void fill_random_bits(uint8_t *random_bits, size_t bit_count)
-{
-    for (size_t i = 0; i < bit_count; ++i) {
-        random_bits[i] = static_cast<uint8_t>(rand() % 2);
+// Кадр BPSK: текст кодируется старшим битом вперёд.
+std::vector<int16_t> makeFrame(const std::string& text, size_t mtu) {
+    std::vector<int16_t> out(mtu * 2, 0);
+    if (mtu <= HEADER) return out;
+    out[0] = out[1] = out[10] = out[11] = -1;
+    const size_t bits = std::min(text.size() * 8, (mtu - HEADER) / SAMPLES_PER_BIT);
+    for (size_t k = 0; k < bits; ++k) {
+        const unsigned char byte = static_cast<unsigned char>(text[k / 8]);
+        const bool one = (byte >> (7 - k % 8)) & 1;
+        const int16_t level = one ? -24000 : 24000; // 1500 << 4
+        for (int j = 0; j < SAMPLES_PER_BIT; ++j)
+            out[2 * (HEADER + k * SAMPLES_PER_BIT + j)] = level;
     }
+    return out;
 }
 
-static void encode_bpsk(const uint8_t *random_bits, int16_t *mapped_buffer, size_t symbol_count)
-{
-    for (size_t i = 0; i < symbol_count; i++)
-    {
-        mapped_buffer[2 * i] = random_bits[i] ? -SYMBOL_AMPLITUDE : SYMBOL_AMPLITUDE;
-        mapped_buffer[2 * i + 1] = 0;
-    }
+void putTimestamp(std::vector<int16_t>& frame, long long ns) {
+    for (int j = 0; j < 8; ++j)
+        frame[2 + j] = static_cast<int16_t>(((static_cast<uint64_t>(ns) >> (8 * j)) & 255) << 4);
 }
 
-static void encode_qpsk(const uint8_t *random_bits, int16_t *mapped_buffer, size_t symbol_count)
-{
-    for (size_t i = 0; i < symbol_count; i++)
-    {
-        mapped_buffer[2 * i] = random_bits[2 * i] ? -SYMBOL_AMPLITUDE : SYMBOL_AMPLITUDE;
-        mapped_buffer[2 * i + 1] = random_bits[2 * i + 1] ? -SYMBOL_AMPLITUDE : SYMBOL_AMPLITUDE;
+// Прямоугольный согласованный фильтр: скользящее среднее по 10 отсчётам.
+std::vector<IQ> averageSymbols(const std::vector<int16_t>& interleaved) {
+    const size_t n = interleaved.size() / 2;
+    std::vector<IQ> result(n);
+    IQ sum(0, 0);
+    for (size_t i = 0; i < n; ++i) {
+        sum += IQ(interleaved[2 * i], interleaved[2 * i + 1]);
+        if (i >= SAMPLES_PER_BIT)
+            sum -= IQ(interleaved[2 * (i - SAMPLES_PER_BIT)],
+                      interleaved[2 * (i - SAMPLES_PER_BIT) + 1]);
+        result[i] = sum / static_cast<float>(SAMPLES_PER_BIT);
     }
+    return result;
 }
 
-static void insert_zero_samples(const int16_t *input_symbols, size_t symbol_count,
-                           int16_t *output_samples, size_t samples_per_symbol)
-{
-    for (size_t i = 0; i < symbol_count; i++)
-    {
-        const size_t base = 2 * i * samples_per_symbol;
-        output_samples[base] = input_symbols[2 * i];
-        output_samples[base + 1] = input_symbols[2 * i + 1];
-        for (size_t j = 1; j < samples_per_symbol; ++j) {
-            output_samples[base + 2 * j] = 0;
-            output_samples[base + 2 * j + 1] = 0;
+// Линейная интерполяция для дробного положения символьного строба.
+IQ sampleAt(const std::vector<IQ>& data, float index) {
+    const size_t a = static_cast<size_t>(std::floor(index));
+    if (a + 1 >= data.size()) return data.back();
+    const float fraction = index - static_cast<float>(a);
+    return data[a] * (1.0f - fraction) + data[a + 1] * fraction;
+}
+
+struct TimingState {
+    std::vector<IQ> decisions;
+    float phase = 0;
+    float averageError = 0;
+    size_t tracked = 0;
+};
+
+TimingState recoverTiming(const std::vector<IQ>& samples) {
+    TimingState result;
+    if (samples.size() < 4 * SAMPLES_PER_BIT) return result;
+
+    // Поиск начальной фазы по максимальной средней энергии символов.
+    const size_t search = std::min(samples.size(), size_t(12000));
+    float best = -1;
+    int offset = 0;
+    for (int shift = 0; shift < SAMPLES_PER_BIT; ++shift) {
+        double power = 0;
+        for (size_t i = shift + SAMPLES_PER_BIT; i < search; i += SAMPLES_PER_BIT)
+            power += std::abs(samples[i]);
+        if (power > best) { best = static_cast<float>(power); offset = shift; }
+    }
+
+    float maximum = 0;
+    for (const IQ& z : samples) maximum = std::max(maximum, std::abs(z));
+    const float gate = std::max(15.0f, maximum * 0.20f);
+    float phase = static_cast<float>(offset + SAMPLES_PER_BIT);
+    float correction = 0;
+    double accumulated = 0;
+    while (phase + 2 < samples.size()) {
+        const IQ now = sampleAt(samples, phase);
+        const IQ before = sampleAt(samples, phase - SAMPLES_PER_BIT);
+        const IQ halfway = sampleAt(samples, phase - SAMPLES_PER_BIT / 2.0f);
+        result.decisions.push_back(now);
+
+        float step = 0;
+        if (std::abs(now) > gate && std::abs(before) > gate) {
+            const float scale = 0.5f * (std::norm(now) + std::norm(before)) + 1e-5f;
+            const float error = std::clamp(std::real((now - before) * std::conj(halfway)) / scale,
+                                           -1.0f, 1.0f);
+            correction = std::clamp(correction + 0.015f * error, -0.35f, 0.35f);
+            step = 0.25f * error + correction;
+            accumulated += std::abs(error);
+            ++result.tracked;
+        }
+        phase += std::clamp(SAMPLES_PER_BIT - step, 9.0f, 11.0f);
+    }
+    result.phase = std::fmod(phase, static_cast<float>(SAMPLES_PER_BIT));
+    result.averageError = result.tracked ? accumulated / result.tracked : 0;
+    return result;
+}
+
+void savePcm(const std::vector<int16_t>& iq, const char* name) {
+    if (FILE* file = std::fopen(name, "wb")) {
+        std::fwrite(iq.data(), sizeof(int16_t), iq.size(), file);
+        std::fclose(file);
+    } else std::perror(name);
+}
+
+// Модель приёмного радиоканала: CFO, шум и неидеальный коэффициент усиления.
+std::vector<int16_t> simulateChannel(const std::vector<int16_t>& tx, size_t frames) {
+    const size_t frameSize = tx.size() / 2;
+    std::vector<int16_t> rx(frames * tx.size());
+    std::mt19937 engine(9);
+    std::normal_distribution<float> noise(0.0f, 13.0f);
+    const float cfo = 320.0f;
+    for (size_t k = 0; k < frames; ++k) {
+        for (size_t i = 0; i < frameSize; ++i) {
+            const size_t t = k * frameSize + i;
+            const float angle = 2 * PI * cfo * static_cast<float>(t / RATE);
+            const IQ source(tx[2 * i], tx[2 * i + 1]);
+            const IQ rotated = source * std::polar(0.018f, angle);
+            const IQ value = rotated + IQ(noise(engine), noise(engine));
+            rx[2 * t] = static_cast<int16_t>(std::clamp(std::round(value.real()), -2047.0f, 2047.0f));
+            rx[2 * t + 1] = static_cast<int16_t>(std::clamp(std::round(value.imag()), -2047.0f, 2047.0f));
         }
     }
+    return rx;
 }
 
-static void apply_pulse_filter(const int16_t *upsampled_data, int16_t *filtered_data,
-                        size_t total_count)
-{
-    for (size_t i = 0; i < total_count; i++)
-    {
-        int32_t i_accumulator = 0, q_accumulator = 0;
-        const size_t tap_count = (i + 1 < SYMBOL_SAMPLES) ? i + 1 : SYMBOL_SAMPLES;
-        for (size_t j = 0; j < tap_count; ++j) {
-            i_accumulator += upsampled_data[2 * (i - j)] * pulse_kernel[j];
-            q_accumulator += upsampled_data[2 * (i - j) + 1] * pulse_kernel[j];
+std::vector<int16_t> capturePluto(const std::string& uri) {
+    SoapySDRKwargs config = {};
+    SoapySDRKwargs_set(&config, "driver", "plutosdr");
+    SoapySDRKwargs_set(&config, "uri", uri.c_str());
+    SoapySDRKwargs_set(&config, "direct", "1");
+    SoapySDRKwargs_set(&config, "timestamp_every", "1920");
+    SoapySDRKwargs_set(&config, "loopback", "0");
+    SoapySDRDevice* device = SoapySDRDevice_make(&config);
+    SoapySDRKwargs_clear(&config);
+    if (!device) {
+        std::cerr << "PlutoSDR недоступен: " << SoapySDRDevice_lastError() << '\n';
+        return {};
+    }
+    for (int direction : {SOAPY_SDR_RX, SOAPY_SDR_TX}) {
+        SoapySDRDevice_setSampleRate(device, direction, 0, RATE);
+        SoapySDRDevice_setFrequency(device, direction, 0, FREQUENCY, nullptr);
+        SoapySDRDevice_setGain(device, direction, 0, direction == SOAPY_SDR_RX ? 10.0 : -40.0);
+    }
+    size_t channels[] = {0};
+    auto* rx = SoapySDRDevice_setupStream(device, SOAPY_SDR_RX, SOAPY_SDR_CS16, channels, 1, nullptr);
+    auto* tx = SoapySDRDevice_setupStream(device, SOAPY_SDR_TX, SOAPY_SDR_CS16, channels, 1, nullptr);
+    if (!rx || !tx) {
+        std::cerr << "Ошибка настройки потоков\n";
+        if (rx) SoapySDRDevice_closeStream(device, rx);
+        if (tx) SoapySDRDevice_closeStream(device, tx);
+        SoapySDRDevice_unmake(device);
+        return {};
+    }
+    SoapySDRDevice_activateStream(device, rx, 0, 0, 0);
+    SoapySDRDevice_activateStream(device, tx, 0, 0, 0);
+    const size_t rxMtu = SoapySDRDevice_getStreamMTU(device, rx);
+    const size_t txMtu = SoapySDRDevice_getStreamMTU(device, tx);
+    std::vector<int16_t> buffer(2 * rxMtu);
+    auto frame = makeFrame("PracticeSDR!", txMtu);
+    std::vector<int16_t> recorded;
+    recorded.reserve(300 * 2 * rxMtu);
+    for (int round = 0; round < 300; ++round) {
+        void* input[] = {buffer.data()};
+        int flags = 0;
+        long long timestamp = 0;
+        const int received = SoapySDRDevice_readStream(device, rx, input, rxMtu, &flags, &timestamp, 200000);
+        if (received <= 0) continue;
+        recorded.insert(recorded.end(), buffer.begin(), buffer.begin() + 2 * received);
+        if (round >= 20 && round % 10 == 0 && (flags & SOAPY_SDR_HAS_TIME)) {
+            const long long sendAt = timestamp + 4'000'000LL;
+            putTimestamp(frame, sendAt);
+            const void* output[] = {frame.data()};
+            int txFlags = SOAPY_SDR_HAS_TIME;
+            const int written = SoapySDRDevice_writeStream(device, tx, output, txMtu,
+                                                           &txFlags, sendAt, 200000);
+            if (written < 0) std::cerr << "Ошибка TX: " << written << '\n';
         }
-        filtered_data[2 * i] = (int16_t)i_accumulator;
-        filtered_data[2 * i + 1] = (int16_t)q_accumulator;
     }
+    SoapySDRDevice_deactivateStream(device, rx, 0, 0);
+    SoapySDRDevice_deactivateStream(device, tx, 0, 0);
+    SoapySDRDevice_closeStream(device, rx);
+    SoapySDRDevice_closeStream(device, tx);
+    SoapySDRDevice_unmake(device);
+    return recorded;
 }
 
-
-static void fill_transmit_frame(int16_t *tx_data, size_t tx_block_size, constellation_t constellation)
-{
-    size_t symbol_count = (tx_block_size - FRAME_PREFIX_SAMPLES) / SYMBOL_SAMPLES;
-    size_t payload_size = symbol_count * SYMBOL_SAMPLES;
-    size_t bits_per_symbol = (constellation == TX_QPSK) ? 2 : 1;  // число бит, кодируемых символом
-
-    uint8_t *random_bits = (uint8_t *)malloc(symbol_count * bits_per_symbol);
-    int16_t *symbol_data = (int16_t *)malloc(symbol_count * 2 * sizeof(int16_t));
-    int16_t *zero_padded = (int16_t *)malloc(payload_size * 2 * sizeof(int16_t));
-    int16_t *filtered_symbols  = (int16_t *)malloc(payload_size * 2 * sizeof(int16_t));
-
-    fill_random_bits(random_bits, symbol_count * bits_per_symbol);
-    if (constellation == TX_QPSK) encode_qpsk(random_bits, symbol_data, symbol_count);
-    else encode_bpsk(random_bits, symbol_data, symbol_count);
-
-    insert_zero_samples(symbol_data, symbol_count, zero_padded, SYMBOL_SAMPLES);
-    apply_pulse_filter(zero_padded, filtered_symbols, payload_size);
-
-    int16_t *payload_start = tx_data + 2 * FRAME_PREFIX_SAMPLES;
-    memset(payload_start, 0, 2 * (tx_block_size - FRAME_PREFIX_SAMPLES) * sizeof(int16_t));
-    // Переносим в буфер пары I/Q, сохраняя выравнивание CS16.
-    for (size_t i = 0; i < payload_size; ++i) {
-        payload_start[2 * i] = filtered_symbols[2 * i] * 16;
-        payload_start[2 * i + 1] = filtered_symbols[2 * i + 1] * 16;
+int main(int argc, char** argv) {
+    const std::string mode = argc > 1 ? argv[1] : "offline";
+    std::vector<int16_t> iq;
+    if (mode == "offline") {
+        iq = simulateChannel(makeFrame("PracticeSDR!", 1920), 300);
+        std::cout << "Программная симуляция, PlutoSDR не используется\n";
+    } else if (mode == "pluto") {
+        iq = capturePluto(argc > 2 ? argv[2] : "usb:");
+    } else {
+        std::cerr << "Использование: " << argv[0] << " offline | pluto [uri]\n";
+        return 1;
     }
-
-    free(random_bits); free(symbol_data); free(zero_padded); free(filtered_symbols);
-}
-
-#define RADIO_SAMPLE_RATE 1e6
-#define RECEIVER_GAIN 30.0
-#define TRANSMITTER_GAIN -40.0
-#define STATUS_PERIOD 250 // период вывода статистики
-#define NOISE_THRESHOLD 20 // порог для отметки слабого входного сигнала
-#define SELECTED_MODULATION TX_QPSK // схема модуляции по умолчанию
-
-static const size_t RX_WARMUP_BUFFERS = 128;
-static const long long TX_ADVANCE_NS = 4000000LL; // передача через 4 мс
-
-double upper_frequency = 821e6;
-double lower_frequency = 766e6;
-
-static volatile sig_atomic_t work_active = 1;
-static void stop_on_interrupt(int interrupt_code) {
-  (void)interrupt_code;
-  work_active = 0;
-  signal(SIGINT, SIG_DFL);
-}
-
-SoapySDRDevice *create_radio(const char *radio_uri) {
-  SoapySDRKwargs device_settings = {};
-  SoapySDRKwargs_set(&device_settings, "driver","plutosdr");
-  SoapySDRKwargs_set(&device_settings, "uri", radio_uri);
-  SoapySDRKwargs_set(&device_settings, "direct", "1");  //
-  SoapySDRKwargs_set(&device_settings, "timestamp_every","1920");  // метки времени через указанный интервал
-  SoapySDRKwargs_set(&device_settings, "loopback", "0");  // отключение программного loopback
-  SoapySDRDevice *radio = SoapySDRDevice_make(&device_settings);  // создание дескриптора SDR
-  SoapySDRKwargs_clear(&device_settings);
-  return radio;
-}
-
-
-int start_radio(const char *radio_uri, bool tx_mode) {
-  SoapySDRDevice *radio = create_radio(radio_uri);
-  if (radio == NULL) {
-    printf("SoapySDRDevice_make fail: %s\n", SoapySDRDevice_lastError());
-    return 1;
-  }
-
-  double receive_frequency = upper_frequency;
-  double transmit_frequency = lower_frequency;
-  const char *mode_label = "rx";
-
-  if (tx_mode) {
-    receive_frequency = lower_frequency;
-    transmit_frequency = upper_frequency;
-    mode_label = "tx";
-  }
-  printf("Режим: %s, устройство: %s\n", mode_label, radio_uri);
-  printf("TX %.0f МГц, RX %.0f МГц, %s, %d отсчетов на символ\n",
-         transmit_frequency / 1e6, receive_frequency / 1e6, SELECTED_MODULATION == TX_QPSK ? "QPSK" : "BPSK", SYMBOL_SAMPLES);
-
-  SoapySDRDevice_setSampleRate(radio, SOAPY_SDR_RX, 0, RADIO_SAMPLE_RATE);
-  SoapySDRDevice_setSampleRate(radio, SOAPY_SDR_TX, 0, RADIO_SAMPLE_RATE);
-  SoapySDRDevice_setFrequency(radio, SOAPY_SDR_RX, 0, receive_frequency, NULL);
-  SoapySDRDevice_setFrequency(radio, SOAPY_SDR_TX, 0, transmit_frequency, NULL);
-
-  size_t channel_ids[] = {0};
-  SoapySDRDevice_setGain(radio, SOAPY_SDR_RX, *channel_ids, RECEIVER_GAIN);
-  SoapySDRDevice_setGain(radio, SOAPY_SDR_TX, *channel_ids, TRANSMITTER_GAIN);
-  size_t number_of_channels = sizeof(channel_ids) / sizeof(channel_ids[0]);
-
-  SoapySDRStream *receiver_stream = SoapySDRDevice_setupStream(radio, SOAPY_SDR_RX, SOAPY_SDR_CS16, channel_ids, number_of_channels, NULL);
-  SoapySDRStream *transmitter_stream = SoapySDRDevice_setupStream(radio, SOAPY_SDR_TX, SOAPY_SDR_CS16, channel_ids, number_of_channels, NULL);
-
-  if (receiver_stream == NULL || transmitter_stream == NULL) {
-    fprintf(stderr, "Не удалось создать SDR поток: %s\n", SoapySDRDevice_lastError());
-    if (receiver_stream != NULL) SoapySDRDevice_closeStream(radio, receiver_stream);
-    if (transmitter_stream != NULL) SoapySDRDevice_closeStream(radio, transmitter_stream);
-    SoapySDRDevice_unmake(radio);
-    return 1;
-  }
-
-  SoapySDRDevice_activateStream(radio, receiver_stream, 0, 0, 0);
-  SoapySDRDevice_activateStream(radio, transmitter_stream, 0, 0, 0);
-
-  size_t rx_block_size = SoapySDRDevice_getStreamMTU(radio, receiver_stream);
-  size_t tx_block_size = SoapySDRDevice_getStreamMTU(radio, transmitter_stream);
-  printf("MTU - TX: %zu, RX: %zu\n", tx_block_size, rx_block_size);
-  int16_t rx_data[2 * rx_block_size];
-  int16_t tx_data[2 * tx_block_size];
-  int16_t file_buffer[2 * tx_block_size];
-
-  const long read_timeout_us = 400000;
-  long long previous_time_ns = 0;
-
-  char capture_filename[64];
-  snprintf(capture_filename, sizeof(capture_filename), "%s_sent.pcm", mode_label);
-  FILE *capture_file = fopen(capture_filename, "wb");
-  size_t block_index = 0;
-
-  // подготовка передаваемого блока
-  fill_transmit_frame(tx_data, tx_block_size, SELECTED_MODULATION);
-
-  for (size_t i = 0; i < 2; i++) {
-    tx_data[0 + i] = 0xffff;
-    tx_data[10 + i] = 0xffff;
-  }
-
-  signal(SIGINT, stop_on_interrupt);
-
-  void *input_buffers[] = {rx_data};
-  // Удаляем старые буферы из очереди приёмника.
-  for (size_t n = 0; n < RX_WARMUP_BUFFERS && work_active; ) {
-    int io_flags;
-    long long receive_time_ns;
-    int read_count = SoapySDRDevice_readStream(radio, receiver_stream, input_buffers, rx_block_size, &io_flags, &receive_time_ns, read_timeout_us);
-    if (read_count <= 0) continue;
-    ++n;
-  }
-
-  printf("Start...\n");
-  int max_amplitude = 0; // максимум за текущий интервал отчёта
-  std::complex<double> phase_product_sum = 0;
-
-  while (work_active) {
-    int io_flags;
-    long long receive_time_ns = previous_time_ns;
-    int read_count = SoapySDRDevice_readStream(radio, receiver_stream, input_buffers, rx_block_size, &io_flags, &receive_time_ns, read_timeout_us);
-    if (read_count <= 0) continue;
-
-    // При пустом чтении не обновляем ни статистику, ни время передачи.
-    // сбор статистики по входному потоку
-    for (int i = 0; i < 2 * read_count; i++)
-      if (abs(rx_data[i]) > max_amplitude)
-        max_amplitude = abs(rx_data[i]);
-
-    for (int i = 1; i < read_count; i++) {
-      std::complex<double> present_sample (rx_data[2 * i], rx_data[2 * i + 1]);
-      std::complex<double> last_sample(rx_data[2 * (i - 1)], rx_data[2 * (i - 1) + 1]);
-      phase_product_sum += present_sample * std::conj(last_sample);
-    }
-
-    if (block_index % STATUS_PERIOD == 0) {
-      double frequency_error_khz = std::arg(phase_product_sum) * RADIO_SAMPLE_RATE / (2.0 * M_PI) / 1e3;
-      printf("Buffer: %zu - Time: %lli | принято: пик %4d из 2047, сдвиг f ~%+.2f кГц%s\n",
-             block_index, receive_time_ns - previous_time_ns, max_amplitude, frequency_error_khz,
-             max_amplitude < NOISE_THRESHOLD ? "  - это шум" : "");
-      max_amplitude = 0;
-      phase_product_sum = 0;
-    }
-    previous_time_ns = receive_time_ns;
-
-    // планирование передачи относительно времени приёма
-    long long scheduled_time_ns = previous_time_ns + TX_ADVANCE_NS;
-
-    for (size_t i = 0; i < 8; i++) {
-      const uint8_t timestamp_part = static_cast<uint8_t>((scheduled_time_ns >> (i * 8)) & 0xff);
-      tx_data[2 + i] = timestamp_part << 4;
-    }
-
-    if (capture_file != NULL) {
-      size_t values_written = 0;
-      for (size_t i = 12; i < 2 * tx_block_size; i++)
-        file_buffer[values_written++] = tx_data[i] / 16;
-      fwrite(file_buffer, sizeof(int16_t), values_written, capture_file);
-    }
-
-    void *output_buffers[] = {tx_data};
-    io_flags = SOAPY_SDR_HAS_TIME;
-    int write_count = SoapySDRDevice_writeStream(radio, transmitter_stream, (const void * const*)output_buffers, tx_block_size, &io_flags, scheduled_time_ns, read_timeout_us);
-    if ((size_t)write_count != tx_block_size) {
-      printf("TX Failed: %i\n", write_count);
-    }
-
-    block_index++;
-  }
-
-  printf("\nОстановка... Записан %s\n", capture_filename);
-  if (capture_file != NULL) fclose(capture_file);
-  SoapySDRDevice_deactivateStream(radio, receiver_stream, 0, 0);
-  SoapySDRDevice_deactivateStream(radio, transmitter_stream, 0, 0);
-  SoapySDRDevice_closeStream(radio, receiver_stream);
-  SoapySDRDevice_closeStream(radio, transmitter_stream);
-  SoapySDRDevice_unmake(radio);
-  return 0;
-}
-
-int main(int argc, char *argv[]) {
-  if (argc < 2) {
-    printf("Использовать так: %s <rx|tx> [uri]\n", argv[0]);
-    return 1;
-  }
-  const char *radio_uri="usb:0.1.5";
-  if (argc > 2) {radio_uri=argv[2];}
-  if (strcmp(argv[1], "rx") == 0){return start_radio(radio_uri, false);}
-  else if (strcmp(argv[1], "tx") == 0) {return start_radio(radio_uri, true);}
-  else {
-    printf("Ошибка режима работы\n");
-    return 1;
-  }
+    if (iq.empty()) return 1;
+    savePcm(iq, "rxdata.pcm");
+    const TimingState sync = recoverTiming(averageSymbols(iq));
+    std::cout << "Отсчётов: " << iq.size() / 2
+              << ", символов: " << sync.decisions.size()
+              << ", фаза: " << sync.phase
+              << ", средняя ошибка: " << sync.averageError
+              << ", активных решений: " << sync.tracked << '\n';
+    return 0;
 }
